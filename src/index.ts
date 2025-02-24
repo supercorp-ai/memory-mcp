@@ -11,7 +11,7 @@ import path from 'path'
 import { promises as fs } from 'fs'
 
 //
-// Logging (same style as the new example)
+// Logging
 //
 const log = (...args: any[]) => console.log('[memory-mcp]', ...args)
 const logErr = (...args: any[]) => console.error('[memory-mcp]', ...args)
@@ -57,14 +57,13 @@ class KnowledgeGraphManager {
       )
     } catch (err: any) {
       if (err.code === 'ENOENT') {
-        // file not found, return empty
         return { entities: [], relations: [] }
       }
       throw err
     }
   }
 
-  async saveGraph(graph: KnowledgeGraph): Promise<void> {
+  async saveGraph(graph: KnowledgeGraph) {
     const lines = [
       ...graph.entities.map(e => JSON.stringify({ type: 'entity', ...e })),
       ...graph.relations.map(r => JSON.stringify({ type: 'relation', ...r }))
@@ -115,7 +114,7 @@ class KnowledgeGraphManager {
     return results
   }
 
-  async deleteEntities(entityNames: string[]): Promise<void> {
+  async deleteEntities(entityNames: string[]) {
     const graph = await this.loadGraph()
     graph.entities = graph.entities.filter(e => !entityNames.includes(e.name))
     graph.relations = graph.relations.filter(
@@ -126,7 +125,7 @@ class KnowledgeGraphManager {
 
   async deleteObservations(
     deletions: { entityName: string; observations: string[] }[]
-  ): Promise<void> {
+  ) {
     const graph = await this.loadGraph()
     deletions.forEach(d => {
       const entity = graph.entities.find(e => e.name === d.entityName)
@@ -139,7 +138,7 @@ class KnowledgeGraphManager {
     await this.saveGraph(graph)
   }
 
-  async deleteRelations(relations: Relation[]): Promise<void> {
+  async deleteRelations(relations: Relation[]) {
     const graph = await this.loadGraph()
     graph.relations = graph.relations.filter(
       r =>
@@ -184,22 +183,6 @@ class KnowledgeGraphManager {
 }
 
 //
-// A cache for KnowledgeGraphManager, keyed by userId
-//
-const managerCache = new Map<string, KnowledgeGraphManager>()
-
-const getManagerForUser = (base: string, userId: string): KnowledgeGraphManager => {
-  if (!userId) {
-    throw new Error('No user ID provided')
-  }
-  if (!managerCache.has(userId)) {
-    const filePath = path.join(base, `${userId}.json`)
-    managerCache.set(userId, new KnowledgeGraphManager(filePath))
-  }
-  return managerCache.get(userId)!
-}
-
-//
 // Provide a standard JSON result for Tools
 //
 const toTextJson = (data: unknown) => ({
@@ -212,11 +195,15 @@ const toTextJson = (data: unknown) => ({
 })
 
 //
-// Build an MCP server with memory tools
+// Create a user-specific McpServer
 //
-const createMemoryServer = (base: string): McpServer => {
+function createMemoryServerForUser(baseDir: string, userId: string): McpServer {
+  // Build or retrieve a manager for userId
+  const filePath = path.join(baseDir, `${userId}.json`)
+  const manager = new KnowledgeGraphManager(filePath)
+
   const server = new McpServer({
-    name: 'Memory MCP Server',
+    name: `Memory MCP Server (User: ${userId})`,
     version: '1.0.0'
   })
 
@@ -230,12 +217,10 @@ const createMemoryServer = (base: string): McpServer => {
         observations: z.array(z.string())
       }))
     },
-    async ({ entities }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ entities }) => {
       try {
-        const manager = getManagerForUser(base, userId)
-        const created = await manager.createEntities(entities)
-        return toTextJson(created)
+        const result = await manager.createEntities(entities)
+        return toTextJson(result)
       } catch (err: any) {
         return toTextJson({ error: String(err.message) })
       }
@@ -252,10 +237,8 @@ const createMemoryServer = (base: string): McpServer => {
         relationType: z.string()
       }))
     },
-    async ({ relations }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ relations }) => {
       try {
-        const manager = getManagerForUser(base, userId)
         const created = await manager.createRelations(relations)
         return toTextJson(created)
       } catch (err: any) {
@@ -273,10 +256,8 @@ const createMemoryServer = (base: string): McpServer => {
         contents: z.array(z.string())
       }))
     },
-    async ({ observations }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ observations }) => {
       try {
-        const manager = getManagerForUser(base, userId)
         const result = await manager.addObservations(observations)
         return toTextJson(result)
       } catch (err: any) {
@@ -291,10 +272,8 @@ const createMemoryServer = (base: string): McpServer => {
     {
       entityNames: z.array(z.string())
     },
-    async ({ entityNames }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ entityNames }) => {
       try {
-        const manager = getManagerForUser(base, userId)
         await manager.deleteEntities(entityNames)
         return toTextJson({ success: true })
       } catch (err: any) {
@@ -312,10 +291,8 @@ const createMemoryServer = (base: string): McpServer => {
         observations: z.array(z.string())
       }))
     },
-    async ({ deletions }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ deletions }) => {
       try {
-        const manager = getManagerForUser(base, userId)
         await manager.deleteObservations(deletions)
         return toTextJson({ success: true })
       } catch (err: any) {
@@ -334,10 +311,8 @@ const createMemoryServer = (base: string): McpServer => {
         relationType: z.string()
       }))
     },
-    async ({ relations }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ relations }) => {
       try {
-        const manager = getManagerForUser(base, userId)
         await manager.deleteRelations(relations)
         return toTextJson({ success: true })
       } catch (err: any) {
@@ -350,10 +325,8 @@ const createMemoryServer = (base: string): McpServer => {
     'read_graph',
     'Read entire knowledge graph',
     {},
-    async (_, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async () => {
       try {
-        const manager = getManagerForUser(base, userId)
         const data = await manager.readGraph()
         return toTextJson(data)
       } catch (err: any) {
@@ -368,10 +341,8 @@ const createMemoryServer = (base: string): McpServer => {
     {
       query: z.string()
     },
-    async ({ query }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ query }) => {
       try {
-        const manager = getManagerForUser(base, userId)
         const data = await manager.searchNodes(query)
         return toTextJson(data)
       } catch (err: any) {
@@ -386,10 +357,8 @@ const createMemoryServer = (base: string): McpServer => {
     {
       names: z.array(z.string())
     },
-    async ({ names }, context) => {
-      const userId = getUserIdFromHeaders(context)
+    async ({ names }) => {
       try {
-        const manager = getManagerForUser(base, userId)
         const data = await manager.openNodes(names)
         return toTextJson(data)
       } catch (err: any) {
@@ -402,31 +371,20 @@ const createMemoryServer = (base: string): McpServer => {
 }
 
 //
-// Helper to read user ID from context.*Request.headers
+// We'll track SSE sessions. Each session is tied to exactly one userId.
+// No "context" passing is needed for each tool call.
 //
-const getUserIdFromHeaders = (context: any): string => {
-  // For SSE transport, it's context.sseRequest
-  // For HTTP transport, it's context.httpRequest
-  // For stdio, there's no request object, so we fail if we can't see it
-  const userId =
-    context?.sseRequest?.headers?.['x-user-id'] ||
-    context?.httpRequest?.headers?.['x-user-id']
-
-  if (typeof userId !== 'string' || !userId.trim()) {
-    throw new Error('Missing or invalid x-user-id header')
-  }
-  return userId.trim()
-}
-
 interface ServerSession {
+  userId: string
   server: McpServer
   transport: SSEServerTransport
+  sessionId: string
 }
 
 //
 // Main function: parse CLI, run SSE or stdio
 //
-const main = async () => {
+async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
     .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
@@ -442,31 +400,48 @@ const main = async () => {
   await fs.mkdir(baseDir, { recursive: true }).catch(() => {})
 
   if (argv.transport === 'stdio') {
-    const server = createMemoryServer(baseDir)
+    // In stdio mode, you might read a userId from an environment var or a prompt.
+    // For demo, we'll say "single user" or require a userId from an env var.
+    const userId = process.env.USER_ID || 'stdio-user'
+    const server = createMemoryServerForUser(baseDir, userId)
     const transport = new StdioServerTransport()
     await server.connect(transport)
     log('Listening on stdio')
     return
   }
 
+  // SSE mode
   const port = argv.port
   const app = express()
   let sessions: ServerSession[] = []
 
+  // parse JSON except for /message
   app.use((req, res, next) => {
     if (req.path === '/message') return next()
     express.json()(req, res, next)
   })
 
+  // GET / => Start SSE session
   app.get('/', async (req: Request, res: Response) => {
-    // We only note that userId is read once a tool call is made.
-    // The SSE handshake itself doesn't do memory ops.
+    // Grab user-id from headers
+    const userId = req.headers['user-id']
+    if (typeof userId !== 'string' || !userId.trim()) {
+      res.status(400).json({ error: 'Missing or invalid "user-id" header' })
+      return
+    }
+
+    // Create an MCP server specifically for this user
+    const server = createMemoryServerForUser(baseDir, userId.trim())
+
+    // Start SSE
     const transport = new SSEServerTransport('/message', res)
-    const server = createMemoryServer(baseDir)
-    await server.connect(transport)
-    sessions.push({ server, transport })
+    await server.connect(transport)  // no context param needed
+
+    // Track session
     const sessionId = transport.sessionId
-    log(`[${sessionId}] New SSE connection established`)
+    sessions.push({ userId, server, transport, sessionId })
+
+    log(`[${sessionId}] SSE connection established for user: "${userId}"`)
 
     transport.onclose = () => {
       log(`[${sessionId}] SSE connection closed`)
@@ -482,18 +457,20 @@ const main = async () => {
     })
   })
 
+  // POST /message => SSE session updates
   app.post('/message', async (req: Request, res: Response) => {
     const sessionId = req.query.sessionId as string
     if (!sessionId) {
       res.status(400).send({ error: 'Missing sessionId' })
       return
     }
-    const target = sessions.find(s => s.transport.sessionId === sessionId)
+    const target = sessions.find(s => s.sessionId === sessionId)
     if (!target) {
       res.status(404).send({ error: 'No active session' })
       return
     }
     try {
+      // Just handle the message. We already know which user this session is for.
       await target.transport.handlePostMessage(req, res)
     } catch (err) {
       logErr(`[${sessionId}] Error handling /message:`, err)
