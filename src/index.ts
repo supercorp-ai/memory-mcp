@@ -9,16 +9,17 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 import path from 'path'
 import { promises as fs } from 'fs'
+import { Redis } from '@upstash/redis'
 
-//
+// -------------------------------------------------------------------
 // Logging
-//
+// -------------------------------------------------------------------
 const log = (...args: any[]) => console.log('[memory-mcp]', ...args)
 const logErr = (...args: any[]) => console.error('[memory-mcp]', ...args)
 
-//
-// Knowledge Graph data structures
-//
+// -------------------------------------------------------------------
+// Data Structures
+// -------------------------------------------------------------------
 interface Entity {
   name: string
   entityType: string
@@ -36,40 +37,34 @@ interface KnowledgeGraph {
   relations: Relation[]
 }
 
-//
-// KnowledgeGraphManager for each user
-//
-class KnowledgeGraphManager {
-  constructor(public filePath: string) {}
+// -------------------------------------------------------------------
+// Shared Manager Interface
+// -------------------------------------------------------------------
+interface IKnowledgeGraphManager {
+  createEntities(entities: Entity[]): Promise<Entity[]>
+  createRelations(relations: Relation[]): Promise<Relation[]>
+  addObservations(
+    observations: { entityName: string; contents: string[] }[]
+  ): Promise<{ entityName: string; addedObservations: string[] }[]>
+  deleteEntities(entityNames: string[]): Promise<void>
+  deleteObservations(
+    deletions: { entityName: string; observations: string[] }[]
+  ): Promise<void>
+  deleteRelations(relations: Relation[]): Promise<void>
+  readGraph(): Promise<KnowledgeGraph>
+  searchNodes(query: string): Promise<KnowledgeGraph>
+  openNodes(names: string[]): Promise<KnowledgeGraph>
+}
 
-  async loadGraph(): Promise<KnowledgeGraph> {
-    try {
-      const data = await fs.readFile(this.filePath, 'utf-8')
-      const lines = data.split('\n').filter(line => line.trim() !== '')
-      return lines.reduce(
-        (graph: KnowledgeGraph, line) => {
-          const item = JSON.parse(line)
-          if (item.type === 'entity') graph.entities.push(item as Entity)
-          if (item.type === 'relation') graph.relations.push(item as Relation)
-          return graph
-        },
-        { entities: [], relations: [] }
-      )
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        return { entities: [], relations: [] }
-      }
-      throw err
-    }
-  }
+// -------------------------------------------------------------------
+// Base Manager: DRY CRUD logic in one place
+// -------------------------------------------------------------------
+abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
+  /** Must load entire graph from storage. */
+  protected abstract loadGraph(): Promise<KnowledgeGraph>
 
-  async saveGraph(graph: KnowledgeGraph) {
-    const lines = [
-      ...graph.entities.map(e => JSON.stringify({ type: 'entity', ...e })),
-      ...graph.relations.map(r => JSON.stringify({ type: 'relation', ...r }))
-    ]
-    await fs.writeFile(this.filePath, lines.join('\n'))
-  }
+  /** Must save entire graph to storage. */
+  protected abstract saveGraph(graph: KnowledgeGraph): Promise<void>
 
   async createEntities(entities: Entity[]): Promise<Entity[]> {
     const graph = await this.loadGraph()
@@ -114,7 +109,7 @@ class KnowledgeGraphManager {
     return results
   }
 
-  async deleteEntities(entityNames: string[]) {
+  async deleteEntities(entityNames: string[]): Promise<void> {
     const graph = await this.loadGraph()
     graph.entities = graph.entities.filter(e => !entityNames.includes(e.name))
     graph.relations = graph.relations.filter(
@@ -125,20 +120,20 @@ class KnowledgeGraphManager {
 
   async deleteObservations(
     deletions: { entityName: string; observations: string[] }[]
-  ) {
+  ): Promise<void> {
     const graph = await this.loadGraph()
-    deletions.forEach(d => {
+    for (const d of deletions) {
       const entity = graph.entities.find(e => e.name === d.entityName)
       if (entity) {
         entity.observations = entity.observations.filter(
           obs => !d.observations.includes(obs)
         )
       }
-    })
+    }
     await this.saveGraph(graph)
   }
 
-  async deleteRelations(relations: Relation[]) {
+  async deleteRelations(relations: Relation[]): Promise<void> {
     const graph = await this.loadGraph()
     graph.relations = graph.relations.filter(
       r =>
@@ -158,11 +153,12 @@ class KnowledgeGraphManager {
 
   async searchNodes(query: string): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph()
+    const lower = query.toLowerCase()
     const filteredEntities = graph.entities.filter(
       e =>
-        e.name.toLowerCase().includes(query.toLowerCase()) ||
-        e.entityType.toLowerCase().includes(query.toLowerCase()) ||
-        e.observations.some(o => o.toLowerCase().includes(query.toLowerCase()))
+        e.name.toLowerCase().includes(lower) ||
+        e.entityType.toLowerCase().includes(lower) ||
+        e.observations.some(o => o.toLowerCase().includes(lower))
     )
     const filteredNames = new Set(filteredEntities.map(e => e.name))
     const filteredRelations = graph.relations.filter(
@@ -182,25 +178,121 @@ class KnowledgeGraphManager {
   }
 }
 
-//
-// Provide a standard JSON result for Tools
-//
-const toTextJson = (data: unknown) => ({
-  content: [
-    {
-      type: 'text' as const,
-      text: JSON.stringify(data, null, 2)
-    }
-  ]
-})
+// -------------------------------------------------------------------
+// Filesystem Manager
+// -------------------------------------------------------------------
+class KnowledgeGraphFsManager extends BaseKnowledgeGraphManager {
+  constructor(private filePath: string) {
+    super()
+  }
 
-//
-// Create a user-specific McpServer
-//
-function createMemoryServerForUser(baseDir: string, userId: string): McpServer {
-  // Build or retrieve a manager for userId
-  const filePath = path.join(baseDir, `${userId}.json`)
-  const manager = new KnowledgeGraphManager(filePath)
+  protected async loadGraph(): Promise<KnowledgeGraph> {
+    try {
+      const data = await fs.readFile(this.filePath, 'utf-8')
+      const lines = data.split('\n').filter(line => line.trim() !== '')
+      return lines.reduce(
+        (graph: KnowledgeGraph, line) => {
+          const item = JSON.parse(line)
+          if (item.type === 'entity') graph.entities.push(item as Entity)
+          if (item.type === 'relation') graph.relations.push(item as Relation)
+          return graph
+        },
+        { entities: [], relations: [] }
+      )
+    } catch (err: any) {
+      if (err.code === 'ENOENT') {
+        return { entities: [], relations: [] }
+      }
+      throw err
+    }
+  }
+
+  protected async saveGraph(graph: KnowledgeGraph) {
+    const lines = [
+      ...graph.entities.map(e => JSON.stringify({ type: 'entity', ...e })),
+      ...graph.relations.map(r => JSON.stringify({ type: 'relation', ...r }))
+    ]
+    await fs.writeFile(this.filePath, lines.join('\n'))
+  }
+}
+
+// -------------------------------------------------------------------
+// Upstash Redis (REST) Manager
+//  - We get a URL *and* a token from CLI
+//  - We'll store data in a single JSON key
+// -------------------------------------------------------------------
+class KnowledgeGraphUpstashRedisManager extends BaseKnowledgeGraphManager {
+  private redis: Redis
+  private key: string
+
+  constructor(url: string, token: string, userId: string) {
+    super()
+    this.redis = new Redis({ url, token })
+    this.key = `graph:${userId}`
+  }
+
+  protected async loadGraph(): Promise<KnowledgeGraph> {
+    const data = await this.redis.get<string>(this.key)
+    if (!data) {
+      return { entities: [], relations: [] }
+    }
+    return JSON.parse(data) as KnowledgeGraph
+  }
+
+  protected async saveGraph(graph: KnowledgeGraph): Promise<void> {
+    await this.redis.set(this.key, JSON.stringify(graph))
+  }
+}
+
+// -------------------------------------------------------------------
+// Minimal JSON result helper
+// -------------------------------------------------------------------
+function toTextJson(data: unknown) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(data, null, 2)
+      }
+    ]
+  }
+}
+
+// -------------------------------------------------------------------
+// Factory: Create the appropriate manager
+// -------------------------------------------------------------------
+function createManager(
+  storage: 'fs' | 'upstash-redis-rest',
+  baseDir: string,
+  userId: string,
+  upstashRedisRestUrl?: string,
+  upstashRedisRestToken?: string
+): IKnowledgeGraphManager {
+  if (storage === 'upstash-redis-rest') {
+    if (!upstashRedisRestUrl || !upstashRedisRestToken) {
+      throw new Error('--upstash-redis-rest-url and --upstash-redis-rest-token are required')
+    }
+    return new KnowledgeGraphUpstashRedisManager(
+      upstashRedisRestUrl,
+      upstashRedisRestToken,
+      userId
+    )
+  }
+  // Default: filesystem
+  return new KnowledgeGraphFsManager(path.join(baseDir, `${userId}.json`))
+}
+
+// -------------------------------------------------------------------
+// Build an MCP server for a single user + chosen manager
+// -------------------------------------------------------------------
+function createMemoryServerForUser(
+  storage: 'fs' | 'upstash-redis-rest',
+  baseDir: string,
+  userId: string,
+  upstashRedisRestUrl?: string,
+  upstashRedisRestToken?: string
+): McpServer {
+  const manager = createManager(storage, baseDir, userId, upstashRedisRestUrl, upstashRedisRestToken)
 
   const server = new McpServer({
     name: `Memory MCP Server (User: ${userId})`,
@@ -370,78 +462,101 @@ function createMemoryServerForUser(baseDir: string, userId: string): McpServer {
   return server
 }
 
-//
-// We'll track SSE sessions. Each session is tied to exactly one userId.
-// No "context" passing is needed for each tool call.
-//
-interface ServerSession {
-  userId: string
-  server: McpServer
-  transport: SSEServerTransport
-  sessionId: string
-}
-
-//
-// Main function: parse CLI, run SSE or stdio
-//
+// -------------------------------------------------------------------
+// Main CLI Entry
+// -------------------------------------------------------------------
 async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
-    .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
+    .option('transport', {
+      type: 'string',
+      choices: ['sse', 'stdio'],
+      default: 'sse'
+    })
+    .option('storage', {
+      type: 'string',
+      choices: ['fs', 'upstash-redis-rest'],
+      default: 'fs',
+      describe: 'Choose storage backend'
+    })
     .option('memoryBase', {
       type: 'string',
-      describe: 'Base directory for storing user memory JSON files',
-      demandOption: true
+      default: './data',
+      describe: 'Local filesystem dir (only if --storage=fs)'
+    })
+    .option('upstashRedisRestUrl', {
+      type: 'string',
+      describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)'
+    })
+    .option('upstashRedisRestToken', {
+      type: 'string',
+      describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)'
     })
     .help()
     .parseSync()
 
-  const baseDir = path.resolve(argv.memoryBase)
-  await fs.mkdir(baseDir, { recursive: true }).catch(() => {})
+  // If file-based, ensure the base dir
+  if (argv.storage === 'fs') {
+    const baseDir = path.resolve(argv.memoryBase)
+    await fs.mkdir(baseDir, { recursive: true }).catch(() => {})
+  }
 
+  // If user picks stdio transport => single user
   if (argv.transport === 'stdio') {
-    // In stdio mode, you might read a userId from an environment var or a prompt.
-    // For demo, we'll say "single user" or require a userId from an env var.
     const userId = process.env.USER_ID || 'stdio-user'
-    const server = createMemoryServerForUser(baseDir, userId)
+    const server = createMemoryServerForUser(
+      argv.storage as 'fs' | 'upstash-redis-rest',
+      path.resolve(argv.memoryBase),
+      userId,
+      argv.upstashRedisRestUrl,
+      argv.upstashRedisRestToken
+    )
     const transport = new StdioServerTransport()
     await server.connect(transport)
     log('Listening on stdio')
     return
   }
 
-  // SSE mode
+  // Otherwise SSE
   const port = argv.port
   const app = express()
+
+  interface ServerSession {
+    userId: string
+    server: McpServer
+    transport: SSEServerTransport
+    sessionId: string
+  }
   let sessions: ServerSession[] = []
 
-  // parse JSON except for /message
+  // parse JSON except /message
   app.use((req, res, next) => {
     if (req.path === '/message') return next()
     express.json()(req, res, next)
   })
 
-  // GET / => Start SSE session
+  // GET / => Start SSE
   app.get('/', async (req: Request, res: Response) => {
-    // Grab user-id from headers
     const userId = req.headers['user-id']
     if (typeof userId !== 'string' || !userId.trim()) {
       res.status(400).json({ error: 'Missing or invalid "user-id" header' })
       return
     }
 
-    // Create an MCP server specifically for this user
-    const server = createMemoryServerForUser(baseDir, userId.trim())
-
-    // Start SSE
+    const server = createMemoryServerForUser(
+      argv.storage as 'fs' | 'upstash-redis-rest',
+      path.resolve(argv.memoryBase),
+      userId.trim(),
+      argv.upstashRedisRestUrl,
+      argv.upstashRedisRestToken
+    )
     const transport = new SSEServerTransport('/message', res)
-    await server.connect(transport)  // no context param needed
+    await server.connect(transport)
 
-    // Track session
     const sessionId = transport.sessionId
     sessions.push({ userId, server, transport, sessionId })
 
-    log(`[${sessionId}] SSE connection established for user: "${userId}"`)
+    log(`[${sessionId}] SSE connected for user: "${userId}"`)
 
     transport.onclose = () => {
       log(`[${sessionId}] SSE connection closed`)
@@ -457,7 +572,7 @@ async function main() {
     })
   })
 
-  // POST /message => SSE session updates
+  // POST /message => SSE updates
   app.post('/message', async (req: Request, res: Response) => {
     const sessionId = req.query.sessionId as string
     if (!sessionId) {
@@ -470,19 +585,21 @@ async function main() {
       return
     }
     try {
-      // Just handle the message. We already know which user this session is for.
       await target.transport.handlePostMessage(req, res)
     } catch (err) {
-      logErr(`[${sessionId}] Error handling /message:`, err)
+      logErr(`[${sessionId}] /message error:`, err)
       res.status(500).send({ error: 'Internal error' })
     }
   })
 
   app.listen(port, () => {
-    log(`Listening on port ${port} (SSE)`)
+    log(`Listening on port ${port} [storage=${argv.storage}]`)
   })
 }
 
+// -------------------------------------------------------------------
+// Start
+// -------------------------------------------------------------------
 main().catch(err => {
   logErr('Fatal error:', err)
   process.exit(1)
