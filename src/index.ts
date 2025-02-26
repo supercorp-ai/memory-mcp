@@ -57,7 +57,7 @@ interface IKnowledgeGraphManager {
 }
 
 // -------------------------------------------------------------------
-// Base Manager: DRY CRUD logic in one place
+// Base Manager (DRY CRUD logic)
 // -------------------------------------------------------------------
 abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
   /** Must load entire graph from storage. */
@@ -180,6 +180,7 @@ abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
 
 // -------------------------------------------------------------------
 // Filesystem Manager
+//    - Stores the entire KnowledgeGraph as one JSON file per user
 // -------------------------------------------------------------------
 class KnowledgeGraphFsManager extends BaseKnowledgeGraphManager {
   constructor(private filePath: string) {
@@ -188,38 +189,26 @@ class KnowledgeGraphFsManager extends BaseKnowledgeGraphManager {
 
   protected async loadGraph(): Promise<KnowledgeGraph> {
     try {
-      const data = await fs.readFile(this.filePath, 'utf-8')
-      const lines = data.split('\n').filter(line => line.trim() !== '')
-      return lines.reduce(
-        (graph: KnowledgeGraph, line) => {
-          const item = JSON.parse(line)
-          if (item.type === 'entity') graph.entities.push(item as Entity)
-          if (item.type === 'relation') graph.relations.push(item as Relation)
-          return graph
-        },
-        { entities: [], relations: [] }
-      )
+      const raw = await fs.readFile(this.filePath, 'utf-8')
+      return JSON.parse(raw) as KnowledgeGraph
     } catch (err: any) {
       if (err.code === 'ENOENT') {
+        // File not found => return empty graph
         return { entities: [], relations: [] }
       }
       throw err
     }
   }
 
-  protected async saveGraph(graph: KnowledgeGraph) {
-    const lines = [
-      ...graph.entities.map(e => JSON.stringify({ type: 'entity', ...e })),
-      ...graph.relations.map(r => JSON.stringify({ type: 'relation', ...r }))
-    ]
-    await fs.writeFile(this.filePath, lines.join('\n'))
+  protected async saveGraph(graph: KnowledgeGraph): Promise<void> {
+    const raw = JSON.stringify(graph, null, 2)
+    await fs.writeFile(this.filePath, raw, 'utf-8')
   }
 }
 
 // -------------------------------------------------------------------
 // Upstash Redis (REST) Manager
-//  - We get a URL *and* a token from CLI
-//  - We'll store data in a single JSON key
+//    - Uses a URL + token, storing the entire graph at a single key
 // -------------------------------------------------------------------
 class KnowledgeGraphUpstashRedisManager extends BaseKnowledgeGraphManager {
   private redis: Redis
@@ -232,15 +221,14 @@ class KnowledgeGraphUpstashRedisManager extends BaseKnowledgeGraphManager {
   }
 
   protected async loadGraph(): Promise<KnowledgeGraph> {
-    const data = await this.redis.get<string>(this.key)
-    if (!data) {
-      return { entities: [], relations: [] }
-    }
-    return JSON.parse(data) as KnowledgeGraph
+    // Upstash auto-handles JSON if we pass a generic type param:
+    const data = await this.redis.get<KnowledgeGraph>(this.key)
+    return data ?? { entities: [], relations: [] }
   }
 
   protected async saveGraph(graph: KnowledgeGraph): Promise<void> {
-    await this.redis.set(this.key, JSON.stringify(graph))
+    // Pass the raw object => Upstash will JSON-serialize
+    await this.redis.set(this.key, graph)
   }
 }
 
@@ -259,7 +247,7 @@ function toTextJson(data: unknown) {
 }
 
 // -------------------------------------------------------------------
-// Factory: Create the appropriate manager
+// Factory: choose the Manager by storage type
 // -------------------------------------------------------------------
 function createManager(
   storage: 'fs' | 'upstash-redis-rest',
@@ -270,7 +258,9 @@ function createManager(
 ): IKnowledgeGraphManager {
   if (storage === 'upstash-redis-rest') {
     if (!upstashRedisRestUrl || !upstashRedisRestToken) {
-      throw new Error('--upstash-redis-rest-url and --upstash-redis-rest-token are required')
+      throw new Error(
+        '--upstash-redis-rest-url and --upstash-redis-rest-token are required for upstash-redis-rest storage'
+      )
     }
     return new KnowledgeGraphUpstashRedisManager(
       upstashRedisRestUrl,
@@ -283,7 +273,7 @@ function createManager(
 }
 
 // -------------------------------------------------------------------
-// Build an MCP server for a single user + chosen manager
+// Create a user-specific McpServer
 // -------------------------------------------------------------------
 function createMemoryServerForUser(
   storage: 'fs' | 'upstash-redis-rest',
@@ -293,12 +283,12 @@ function createMemoryServerForUser(
   upstashRedisRestToken?: string
 ): McpServer {
   const manager = createManager(storage, baseDir, userId, upstashRedisRestUrl, upstashRedisRestToken)
-
   const server = new McpServer({
     name: `Memory MCP Server (User: ${userId})`,
     version: '1.0.0'
   })
 
+  // Tools call manager methods
   server.tool(
     'create_entities',
     'Create new entities',
@@ -463,7 +453,7 @@ function createMemoryServerForUser(
 }
 
 // -------------------------------------------------------------------
-// Main CLI Entry
+// Main CLI entry
 // -------------------------------------------------------------------
 async function main() {
   const argv = yargs(hideBin(process.argv))
@@ -482,7 +472,7 @@ async function main() {
     .option('memoryBase', {
       type: 'string',
       default: './data',
-      describe: 'Local filesystem dir (only if --storage=fs)'
+      describe: 'Local filesystem directory (only if --storage=fs)'
     })
     .option('upstashRedisRestUrl', {
       type: 'string',
@@ -501,7 +491,7 @@ async function main() {
     await fs.mkdir(baseDir, { recursive: true }).catch(() => {})
   }
 
-  // If user picks stdio transport => single user
+  // If user picks stdio => single user mode
   if (argv.transport === 'stdio') {
     const userId = process.env.USER_ID || 'stdio-user'
     const server = createMemoryServerForUser(
@@ -517,7 +507,7 @@ async function main() {
     return
   }
 
-  // Otherwise SSE
+  // Else SSE
   const port = argv.port
   const app = express()
 
@@ -572,7 +562,7 @@ async function main() {
     })
   })
 
-  // POST /message => SSE updates
+  // POST /message => SSE session updates
   app.post('/message', async (req: Request, res: Response) => {
     const sessionId = req.query.sessionId as string
     if (!sessionId) {
@@ -592,13 +582,14 @@ async function main() {
     }
   })
 
+  // Listen
   app.listen(port, () => {
     log(`Listening on port ${port} [storage=${argv.storage}]`)
   })
 }
 
 // -------------------------------------------------------------------
-// Start
+// Boot
 // -------------------------------------------------------------------
 main().catch(err => {
   logErr('Fatal error:', err)
