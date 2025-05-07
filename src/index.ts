@@ -406,7 +406,10 @@ function createMemoryServerForUser(
   server.tool(
     'read_graph',
     'Read entire knowledge graph',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const data = await manager.readGraph()
