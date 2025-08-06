@@ -6,6 +6,9 @@ import express, { Request, Response } from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
+import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import path from 'path'
 import { promises as fs } from 'fs'
@@ -42,18 +45,18 @@ interface KnowledgeGraph {
 // -------------------------------------------------------------------
 interface IKnowledgeGraphManager {
   createEntities(entities: Entity[]): Promise<Entity[]>
-  createRelations(relations: Relation[]): Promise<Relation[]>
-  addObservations(
-    observations: { entityName: string; contents: string[] }[]
-  ): Promise<{ entityName: string; addedObservations: string[] }[]>
-  deleteEntities(entityNames: string[]): Promise<void>
-  deleteObservations(
-    deletions: { entityName: string; observations: string[] }[]
-  ): Promise<void>
-  deleteRelations(relations: Relation[]): Promise<void>
-  readGraph(): Promise<KnowledgeGraph>
-  searchNodes(query: string): Promise<KnowledgeGraph>
-  openNodes(names: string[]): Promise<KnowledgeGraph>
+    createRelations(relations: Relation[]): Promise<Relation[]>
+    addObservations(
+      observations: { entityName: string; contents: string[] }[]
+    ): Promise<{ entityName: string; addedObservations: string[] }[]>
+    deleteEntities(entityNames: string[]): Promise<void>
+    deleteObservations(
+      deletions: { entityName: string; observations: string[] }[]
+    ): Promise<void>
+    deleteRelations(relations: Relation[]): Promise<void>
+    readGraph(): Promise<KnowledgeGraph>
+    searchNodes(query: string): Promise<KnowledgeGraph>
+    openNodes(names: string[]): Promise<KnowledgeGraph>
 }
 
 // -------------------------------------------------------------------
@@ -63,29 +66,29 @@ abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
   /** Must load entire graph from storage. */
   protected abstract loadGraph(): Promise<KnowledgeGraph>
 
-  /** Must save entire graph to storage. */
-  protected abstract saveGraph(graph: KnowledgeGraph): Promise<void>
+    /** Must save entire graph to storage. */
+    protected abstract saveGraph(graph: KnowledgeGraph): Promise<void>
 
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
-    const graph = await this.loadGraph()
-    const newEntities = entities.filter(
-      e => !graph.entities.some(existing => existing.name === e.name)
-    )
-    graph.entities.push(...newEntities)
-    await this.saveGraph(graph)
-    return newEntities
-  }
+    async createEntities(entities: Entity[]): Promise<Entity[]> {
+      const graph = await this.loadGraph()
+      const newEntities = entities.filter(
+        e => !graph.entities.some(existing => existing.name === e.name)
+      )
+      graph.entities.push(...newEntities)
+      await this.saveGraph(graph)
+      return newEntities
+    }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
     const graph = await this.loadGraph()
     const newRelations = relations.filter(
       r =>
-        !graph.relations.some(
-          existing =>
-            existing.from === r.from &&
-            existing.to === r.to &&
-            existing.relationType === r.relationType
-        )
+      !graph.relations.some(
+        existing =>
+        existing.from === r.from &&
+        existing.to === r.to &&
+        existing.relationType === r.relationType
+      )
     )
     graph.relations.push(...newRelations)
     await this.saveGraph(graph)
@@ -137,12 +140,12 @@ abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
     const graph = await this.loadGraph()
     graph.relations = graph.relations.filter(
       r =>
-        !relations.some(
-          x =>
-            r.from === x.from &&
-            r.to === x.to &&
-            r.relationType === x.relationType
-        )
+      !relations.some(
+        x =>
+        r.from === x.from &&
+        r.to === x.to &&
+        r.relationType === x.relationType
+      )
     )
     await this.saveGraph(graph)
   }
@@ -156,9 +159,9 @@ abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
     const lower = query.toLowerCase()
     const filteredEntities = graph.entities.filter(
       e =>
-        e.name.toLowerCase().includes(lower) ||
-        e.entityType.toLowerCase().includes(lower) ||
-        e.observations.some(o => o.toLowerCase().includes(lower))
+      e.name.toLowerCase().includes(lower) ||
+      e.entityType.toLowerCase().includes(lower) ||
+      e.observations.some(o => o.toLowerCase().includes(lower))
     )
     const filteredNames = new Set(filteredEntities.map(e => e.name))
     const filteredRelations = graph.relations.filter(
@@ -463,7 +466,7 @@ async function main() {
     .option('port', { type: 'number', default: 8000 })
     .option('transport', {
       type: 'string',
-      choices: ['sse', 'stdio'],
+      choices: ['sse', 'http', 'stdio'],
       default: 'sse'
     })
     .option('storage', {
@@ -508,87 +511,236 @@ async function main() {
     await server.connect(transport)
     log('Listening on stdio')
     return
-  }
+  } else if (argv.transport === 'sse') {
+    // Else SSE
+    const port = argv.port
+    const app = express()
 
-  // Else SSE
-  const port = argv.port
-  const app = express()
-
-  interface ServerSession {
-    userId: string
-    server: McpServer
-    transport: SSEServerTransport
-    sessionId: string
-  }
-  let sessions: ServerSession[] = []
-
-  // parse JSON except /message
-  app.use((req, res, next) => {
-    if (req.path === '/message') return next()
-    express.json()(req, res, next)
-  })
-
-  // GET / => Start SSE
-  app.get('/', async (req: Request, res: Response) => {
-    const userId = req.headers['user-id']
-    if (typeof userId !== 'string' || !userId.trim()) {
-      res.status(400).json({ error: 'Missing or invalid "user-id" header' })
-      return
+    interface ServerSession {
+      userId: string
+      server: McpServer
+      transport: SSEServerTransport
+      sessionId: string
     }
+    let sessions: ServerSession[] = []
 
-    const server = createMemoryServerForUser(
-      argv.storage as 'fs' | 'upstash-redis-rest',
-      path.resolve(argv.memoryBase),
-      userId.trim(),
-      argv.upstashRedisRestUrl,
-      argv.upstashRedisRestToken
-    )
-    const transport = new SSEServerTransport('/message', res)
-    await server.connect(transport)
-
-    const sessionId = transport.sessionId
-    sessions.push({ userId, server, transport, sessionId })
-
-    log(`[${sessionId}] SSE connected for user: "${userId}"`)
-
-    transport.onclose = () => {
-      log(`[${sessionId}] SSE connection closed`)
-      sessions = sessions.filter(s => s.transport !== transport)
-    }
-    transport.onerror = (err: Error) => {
-      logErr(`[${sessionId}] SSE error:`, err)
-      sessions = sessions.filter(s => s.transport !== transport)
-    }
-    req.on('close', () => {
-      log(`[${sessionId}] Client disconnected`)
-      sessions = sessions.filter(s => s.transport !== transport)
+    // parse JSON except /message
+    app.use((req, res, next) => {
+      if (req.path === '/message') return next()
+      express.json()(req, res, next)
     })
-  })
 
-  // POST /message => SSE session updates
-  app.post('/message', async (req: Request, res: Response) => {
-    const sessionId = req.query.sessionId as string
-    if (!sessionId) {
-      res.status(400).send({ error: 'Missing sessionId' })
-      return
-    }
-    const target = sessions.find(s => s.sessionId === sessionId)
-    if (!target) {
-      res.status(404).send({ error: 'No active session' })
-      return
-    }
-    try {
-      await target.transport.handlePostMessage(req, res)
-    } catch (err) {
-      logErr(`[${sessionId}] /message error:`, err)
-      res.status(500).send({ error: 'Internal error' })
-    }
-  })
+    // GET / => Start SSE
+    app.get('/', async (req: Request, res: Response) => {
+      const userId = req.headers['user-id']
+      if (typeof userId !== 'string' || !userId.trim()) {
+        res.status(400).json({ error: 'Missing or invalid "user-id" header' })
+        return
+      }
 
-  // Listen
-  app.listen(port, () => {
-    log(`Listening on port ${port} [storage=${argv.storage}]`)
-  })
+      const server = createMemoryServerForUser(
+        argv.storage as 'fs' | 'upstash-redis-rest',
+        path.resolve(argv.memoryBase),
+        userId.trim(),
+        argv.upstashRedisRestUrl,
+        argv.upstashRedisRestToken
+      )
+      const transport = new SSEServerTransport('/message', res)
+      await server.connect(transport)
+
+      const sessionId = transport.sessionId
+      sessions.push({ userId, server, transport, sessionId })
+
+      log(`[${sessionId}] SSE connected for user: "${userId}"`)
+
+      transport.onclose = () => {
+        log(`[${sessionId}] SSE connection closed`)
+        sessions = sessions.filter(s => s.transport !== transport)
+      }
+      transport.onerror = (err: Error) => {
+        logErr(`[${sessionId}] SSE error:`, err)
+        sessions = sessions.filter(s => s.transport !== transport)
+      }
+      req.on('close', () => {
+        log(`[${sessionId}] Client disconnected`)
+        sessions = sessions.filter(s => s.transport !== transport)
+      })
+    })
+
+    // POST /message => SSE session updates
+    app.post('/message', async (req: Request, res: Response) => {
+      const sessionId = req.query.sessionId as string
+      if (!sessionId) {
+        res.status(400).send({ error: 'Missing sessionId' })
+        return
+      }
+      const target = sessions.find(s => s.sessionId === sessionId)
+      if (!target) {
+        res.status(404).send({ error: 'No active session' })
+        return
+      }
+      try {
+        await target.transport.handlePostMessage(req, res)
+      } catch (err) {
+        logErr(`[${sessionId}] /message error:`, err)
+        res.status(500).send({ error: 'Internal error' })
+      }
+    })
+
+    // Listen
+    app.listen(port, () => {
+      log(`Listening for SSE on port ${port} [storage=${argv.storage}]`)
+    })
+  } else if (argv.transport === 'http') {
+    const port = argv.port
+    const app = express()
+
+    // IMPORTANT: Do not JSON-parse the MCP endpoint — the transport needs raw body/stream.
+    app.use((req, res, next) => {
+      if (req.path === '/') return next()
+      return express.json()(req, res, next)
+    })
+
+    interface HttpSession {
+      userId: string
+      server: McpServer
+      transport: StreamableHTTPServerTransport
+    }
+    const sessions = new Map<string, HttpSession>()
+    const eventStore = new InMemoryEventStore()
+
+    function createServerForUser(userId: string) {
+      return createMemoryServerForUser(
+        argv.storage as 'fs' | 'upstash-redis-rest',
+        path.resolve(argv.memoryBase),
+        userId,
+        argv.upstashRedisRestUrl,
+        argv.upstashRedisRestToken
+      )
+    }
+
+    // POST / => initialization (no session yet) or reuse (with mcp-session-id)
+    app.post('/', async (req: Request, res: Response) => {
+      try {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined
+        if (sessionId && sessions.has(sessionId)) {
+          const { transport } = sessions.get(sessionId)!
+          await transport.handleRequest(req, res)
+          return
+        }
+
+        console.dir({ headers: req.headers, body: req.body }, { depth: null })
+
+        // Require user-id on initialization; do not allow anonymous
+        const userIdHeader = req.headers['user-id']
+        const userId =
+          typeof userIdHeader === 'string' && userIdHeader.trim()
+            ? userIdHeader.trim()
+            : undefined
+        if (!userId) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: Missing "user-id" header' },
+            id: (req as any)?.body?.id
+          })
+          return
+        }
+
+        const server = createServerForUser(userId)
+
+        let transport!: StreamableHTTPServerTransport
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          eventStore,
+          onsessioninitialized: (newSessionId: string) => {
+            sessions.set(newSessionId, { userId, server, transport })
+            log(`[${newSessionId}] HTTP session initialized for user "${userId}"`)
+          }
+        })
+
+        transport.onclose = async () => {
+          const sid = transport.sessionId
+          if (sid && sessions.has(sid)) {
+            sessions.delete(sid)
+            log(`[${sid}] Transport closed; removed from session map`)
+          }
+          try {
+            await server.close()
+          } catch (e) {
+            // best-effort cleanup; ignore if already closed
+          }
+        }
+
+        await server.connect(transport)
+        await transport.handleRequest(req, res)
+      } catch (err) {
+        logErr('Error handling MCP POST /:', err)
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          })
+        }
+      }
+    })
+
+    // GET / => SSE stream for server->client events (Streamable HTTP)
+    app.get('/', async (req: Request, res: Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        })
+        return
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!
+        await transport.handleRequest(req, res)
+      } catch (err) {
+        logErr(`[${sessionId}] Error handling MCP GET /:`, err)
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          })
+        }
+      }
+    })
+
+    // DELETE / => session termination
+    app.delete('/', async (req: Request, res: Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        })
+        return
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!
+        await transport.handleRequest(req, res)
+      } catch (err) {
+        logErr(`[${sessionId}] Error handling MCP DELETE /:`, err)
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Error handling session termination' },
+            id: (req as any)?.body?.id
+          })
+        }
+      }
+    })
+
+    app.listen(port, () => {
+      log(`Listening for Streamable HTTP on port ${port} [storage=${argv.storage}]`)
+    })
+  }
 }
 
 // -------------------------------------------------------------------
