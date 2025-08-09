@@ -45,18 +45,18 @@ interface KnowledgeGraph {
 // -------------------------------------------------------------------
 interface IKnowledgeGraphManager {
   createEntities(entities: Entity[]): Promise<Entity[]>
-    createRelations(relations: Relation[]): Promise<Relation[]>
-    addObservations(
-      observations: { entityName: string; contents: string[] }[]
-    ): Promise<{ entityName: string; addedObservations: string[] }[]>
-    deleteEntities(entityNames: string[]): Promise<void>
-    deleteObservations(
-      deletions: { entityName: string; observations: string[] }[]
-    ): Promise<void>
-    deleteRelations(relations: Relation[]): Promise<void>
-    readGraph(): Promise<KnowledgeGraph>
-    searchNodes(query: string): Promise<KnowledgeGraph>
-    openNodes(names: string[]): Promise<KnowledgeGraph>
+  createRelations(relations: Relation[]): Promise<Relation[]>
+  addObservations(
+    observations: { entityName: string; contents: string[] }[]
+  ): Promise<{ entityName: string; addedObservations: string[] }[]>
+  deleteEntities(entityNames: string[]): Promise<void>
+  deleteObservations(
+    deletions: { entityName: string; observations: string[] }[]
+  ): Promise<void>
+  deleteRelations(relations: Relation[]): Promise<void>
+  readGraph(): Promise<KnowledgeGraph>
+  searchNodes(query: string): Promise<KnowledgeGraph>
+  openNodes(names: string[]): Promise<KnowledgeGraph>
 }
 
 // -------------------------------------------------------------------
@@ -66,29 +66,29 @@ abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
   /** Must load entire graph from storage. */
   protected abstract loadGraph(): Promise<KnowledgeGraph>
 
-    /** Must save entire graph to storage. */
-    protected abstract saveGraph(graph: KnowledgeGraph): Promise<void>
+  /** Must save entire graph to storage. */
+  protected abstract saveGraph(graph: KnowledgeGraph): Promise<void>
 
-    async createEntities(entities: Entity[]): Promise<Entity[]> {
-      const graph = await this.loadGraph()
-      const newEntities = entities.filter(
-        e => !graph.entities.some(existing => existing.name === e.name)
-      )
-      graph.entities.push(...newEntities)
-      await this.saveGraph(graph)
-      return newEntities
-    }
+  async createEntities(entities: Entity[]): Promise<Entity[]> {
+    const graph = await this.loadGraph()
+    const newEntities = entities.filter(
+      e => !graph.entities.some(existing => existing.name === e.name)
+    )
+    graph.entities.push(...newEntities)
+    await this.saveGraph(graph)
+    return newEntities
+  }
 
   async createRelations(relations: Relation[]): Promise<Relation[]> {
     const graph = await this.loadGraph()
     const newRelations = relations.filter(
       r =>
-      !graph.relations.some(
-        existing =>
-        existing.from === r.from &&
-        existing.to === r.to &&
-        existing.relationType === r.relationType
-      )
+        !graph.relations.some(
+          existing =>
+            existing.from === r.from &&
+            existing.to === r.to &&
+            existing.relationType === r.relationType
+        )
     )
     graph.relations.push(...newRelations)
     await this.saveGraph(graph)
@@ -140,12 +140,12 @@ abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
     const graph = await this.loadGraph()
     graph.relations = graph.relations.filter(
       r =>
-      !relations.some(
-        x =>
-        r.from === x.from &&
-        r.to === x.to &&
-        r.relationType === x.relationType
-      )
+        !relations.some(
+          x =>
+            r.from === x.from &&
+            r.to === x.to &&
+            r.relationType === x.relationType
+        )
     )
     await this.saveGraph(graph)
   }
@@ -159,9 +159,9 @@ abstract class BaseKnowledgeGraphManager implements IKnowledgeGraphManager {
     const lower = query.toLowerCase()
     const filteredEntities = graph.entities.filter(
       e =>
-      e.name.toLowerCase().includes(lower) ||
-      e.entityType.toLowerCase().includes(lower) ||
-      e.observations.some(o => o.toLowerCase().includes(lower))
+        e.name.toLowerCase().includes(lower) ||
+        e.entityType.toLowerCase().includes(lower) ||
+        e.observations.some(o => o.toLowerCase().includes(lower))
     )
     const filteredNames = new Set(filteredEntities.map(e => e.name))
     const filteredRelations = graph.relations.filter(
@@ -224,13 +224,11 @@ class KnowledgeGraphUpstashRedisManager extends BaseKnowledgeGraphManager {
   }
 
   protected async loadGraph(): Promise<KnowledgeGraph> {
-    // Upstash auto-handles JSON if we pass a generic type param:
     const data = await this.redis.get<KnowledgeGraph>(this.key)
     return data ?? { entities: [], relations: [] }
   }
 
   protected async saveGraph(graph: KnowledgeGraph): Promise<void> {
-    // Pass the raw object => Upstash will JSON-serialize
     await this.redis.set(this.key, graph)
   }
 }
@@ -271,7 +269,6 @@ function createManager(
       userId
     )
   }
-  // Default: filesystem
   return new KnowledgeGraphFsManager(path.join(baseDir, `${userId}.json`))
 }
 
@@ -282,8 +279,9 @@ function createMemoryServerForUser(
   storage: 'fs' | 'upstash-redis-rest',
   baseDir: string,
   userId: string,
-  upstashRedisRestUrl?: string,
-  upstashRedisRestToken?: string
+  upstashRedisRestUrl: string | undefined,
+  upstashRedisRestToken: string | undefined,
+  toolsPrefix: string
 ): McpServer {
   const manager = createManager(storage, baseDir, userId, upstashRedisRestUrl, upstashRedisRestToken)
   const server = new McpServer({
@@ -293,7 +291,7 @@ function createMemoryServerForUser(
 
   // Tools call manager methods
   server.tool(
-    'create_entities',
+    `${toolsPrefix}create_entities`,
     'Create new entities',
     {
       entities: z.array(z.object({
@@ -313,7 +311,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'create_relations',
+    `${toolsPrefix}create_relations`,
     'Create new relations',
     {
       relations: z.array(z.object({
@@ -333,7 +331,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'add_observations',
+    `${toolsPrefix}add_observations`,
     'Add observations to existing entities',
     {
       observations: z.array(z.object({
@@ -352,7 +350,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'delete_entities',
+    `${toolsPrefix}delete_entities`,
     'Delete entities (and their relations)',
     {
       entityNames: z.array(z.string())
@@ -368,7 +366,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'delete_observations',
+    `${toolsPrefix}delete_observations`,
     'Delete observations from entities',
     {
       deletions: z.array(z.object({
@@ -387,7 +385,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'delete_relations',
+    `${toolsPrefix}delete_relations`,
     'Delete relations',
     {
       relations: z.array(z.object({
@@ -407,7 +405,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'read_graph',
+    `${toolsPrefix}read_graph`,
     'Read entire knowledge graph',
     {
       // TODO: MCP SDK bug patch - remove when fixed
@@ -424,7 +422,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'search_nodes',
+    `${toolsPrefix}search_nodes`,
     'Search nodes by query',
     {
       query: z.string()
@@ -440,7 +438,7 @@ function createMemoryServerForUser(
   )
 
   server.tool(
-    'open_nodes',
+    `${toolsPrefix}open_nodes`,
     'Open specific nodes by name',
     {
       names: z.array(z.string())
@@ -488,6 +486,17 @@ async function main() {
       type: 'string',
       describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)'
     })
+    .option('toolsPrefix', {
+      type: 'string',
+      default: '',
+      describe: 'Prefix to add to all tool names.'
+    })
+    .option('storageHeaderKey', {
+      type: 'string',
+      default: 'user-id',
+      describe:
+        'Header key used to resolve the workspace/user identifier (e.g., "workspace-user"). Defaults to "user-id" for backward compatibility.'
+    })
     .help()
     .parseSync()
 
@@ -497,6 +506,9 @@ async function main() {
     await fs.mkdir(baseDir, { recursive: true }).catch(() => {})
   }
 
+  const toolsPrefix: string = (argv.toolsPrefix as string) || ''
+  const storageHeaderKeyLower = (argv.storageHeaderKey as string).toLowerCase()
+
   // If user picks stdio => single user mode
   if (argv.transport === 'stdio') {
     const userId = process.env.USER_ID || 'stdio-user'
@@ -505,14 +517,15 @@ async function main() {
       path.resolve(argv.memoryBase),
       userId,
       argv.upstashRedisRestUrl,
-      argv.upstashRedisRestToken
+      argv.upstashRedisRestToken,
+      toolsPrefix
     )
     const transport = new StdioServerTransport()
     await server.connect(transport)
     log('Listening on stdio')
     return
   } else if (argv.transport === 'sse') {
-    // Else SSE
+    // SSE
     const port = argv.port
     const app = express()
 
@@ -532,18 +545,21 @@ async function main() {
 
     // GET / => Start SSE
     app.get('/', async (req: Request, res: Response) => {
-      const userId = req.headers['user-id']
-      if (typeof userId !== 'string' || !userId.trim()) {
-        res.status(400).json({ error: 'Missing or invalid "user-id" header' })
+      const raw = req.headers[storageHeaderKeyLower]
+      const userId =
+        typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
+      if (!userId) {
+        res.status(400).json({ error: `Missing or invalid "${argv.storageHeaderKey}" header` })
         return
       }
 
       const server = createMemoryServerForUser(
         argv.storage as 'fs' | 'upstash-redis-rest',
         path.resolve(argv.memoryBase),
-        userId.trim(),
+        userId,
         argv.upstashRedisRestUrl,
-        argv.upstashRedisRestToken
+        argv.upstashRedisRestToken,
+        toolsPrefix
       )
       const transport = new SSEServerTransport('/message', res)
       await server.connect(transport)
@@ -551,7 +567,7 @@ async function main() {
       const sessionId = transport.sessionId
       sessions.push({ userId, server, transport, sessionId })
 
-      log(`[${sessionId}] SSE connected for user: "${userId}"`)
+      log(`[${sessionId}] SSE connected for ${argv.storageHeaderKey}="${userId}"`)
 
       transport.onclose = () => {
         log(`[${sessionId}] SSE connection closed`)
@@ -589,7 +605,7 @@ async function main() {
 
     // Listen
     app.listen(port, () => {
-      log(`Listening for SSE on port ${port} [storage=${argv.storage}]`)
+      log(`Listening for SSE on port ${port} [storage=${argv.storage}] using header "${argv.storageHeaderKey}"`)
     })
   } else if (argv.transport === 'http') {
     const port = argv.port
@@ -615,7 +631,8 @@ async function main() {
         path.resolve(argv.memoryBase),
         userId,
         argv.upstashRedisRestUrl,
-        argv.upstashRedisRestToken
+        argv.upstashRedisRestToken,
+        toolsPrefix
       )
     }
 
@@ -629,18 +646,14 @@ async function main() {
           return
         }
 
-        console.dir({ headers: req.headers, body: req.body }, { depth: null })
-
-        // Require user-id on initialization; do not allow anonymous
-        const userIdHeader = req.headers['user-id']
+        // Require user header on initialization; do not allow anonymous
+        const raw = req.headers[storageHeaderKeyLower]
         const userId =
-          typeof userIdHeader === 'string' && userIdHeader.trim()
-            ? userIdHeader.trim()
-            : undefined
+          typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
         if (!userId) {
           res.status(400).json({
             jsonrpc: '2.0',
-            error: { code: -32000, message: 'Bad Request: Missing "user-id" header' },
+            error: { code: -32000, message: `Bad Request: Missing "${argv.storageHeaderKey}" header` },
             id: (req as any)?.body?.id
           })
           return
@@ -654,7 +667,7 @@ async function main() {
           eventStore,
           onsessioninitialized: (newSessionId: string) => {
             sessions.set(newSessionId, { userId, server, transport })
-            log(`[${newSessionId}] HTTP session initialized for user "${userId}"`)
+            log(`[${newSessionId}] HTTP session initialized for ${argv.storageHeaderKey}="${userId}"`)
           }
         })
 
@@ -666,7 +679,7 @@ async function main() {
           }
           try {
             await server.close()
-          } catch (e) {
+          } catch {
             // best-effort cleanup; ignore if already closed
           }
         }
@@ -738,7 +751,7 @@ async function main() {
     })
 
     app.listen(port, () => {
-      log(`Listening for Streamable HTTP on port ${port} [storage=${argv.storage}]`)
+      log(`Listening for Streamable HTTP on port ${port} [storage=${argv.storage}] using header "${argv.storageHeaderKey}"`)
     })
   }
 }
