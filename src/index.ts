@@ -497,6 +497,12 @@ async function main() {
       describe:
         'Header key used to resolve the workspace/user identifier (e.g., "workspace-user"). Defaults to "user-id" for backward compatibility.'
     })
+    .option('fallbackStorageHeaderValue', {
+      type: 'string',
+      default: undefined,
+      describe:
+        '(Optional) Fixed header value to use for storage key resolution, instead of reading from request headers. Mainly for testing.'
+    })
     .help()
     .parseSync()
 
@@ -511,7 +517,7 @@ async function main() {
 
   // If user picks stdio => single user mode
   if (argv.transport === 'stdio') {
-    const userId = process.env.USER_ID || 'stdio-user'
+    const userId = argv.fallbackStorageHeaderValue || 'stdio-user'
     const server = createMemoryServerForUser(
       argv.storage as 'fs' | 'upstash-redis-rest',
       path.resolve(argv.memoryBase),
@@ -547,7 +553,7 @@ async function main() {
     app.get('/', async (req: Request, res: Response) => {
       const raw = req.headers[storageHeaderKeyLower]
       const userId =
-        typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
+        typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
       if (!userId) {
         res.status(400).json({ error: `Missing or invalid "${argv.storageHeaderKey}" header` })
         return
@@ -649,7 +655,7 @@ async function main() {
         // Require user header on initialization; do not allow anonymous
         const raw = req.headers[storageHeaderKeyLower]
         const userId =
-          typeof raw === 'string' && raw.trim() ? raw.trim() : undefined
+          typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
         if (!userId) {
           res.status(400).json({
             jsonrpc: '2.0',
