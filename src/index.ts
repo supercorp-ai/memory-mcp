@@ -741,19 +741,26 @@ async function main() {
         })
         return
       }
-      try {
-        const { transport } = sessions.get(sessionId)!
-        await transport.handleRequest(req, res)
-      } catch (err) {
-        logErr(`[${sessionId}] Error handling MCP DELETE /:`, err)
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Error handling session termination' },
-            id: (req as any)?.body?.id
-          })
-        }
-      }
+
+      // Handle OpenAI MCP bug
+      res.status(200).json({
+        jsonrpc: '2.0',
+        result: {},
+      })
+
+      // try {
+      //   const { transport } = sessions.get(sessionId)!
+      //   await transport.handleRequest(req, res)
+      // } catch (err) {
+      //   logErr(`[${sessionId}] Error handling MCP DELETE /:`, err)
+      //   if (!res.headersSent) {
+      //     res.status(500).json({
+      //       jsonrpc: '2.0',
+      //       error: { code: -32603, message: 'Error handling session termination' },
+      //       id: (req as any)?.body?.id
+      //     })
+      //   }
+      // }
     })
 
     app.listen(port, () => {
