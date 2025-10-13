@@ -467,6 +467,13 @@ async function main() {
       choices: ['sse', 'http', 'stdio'],
       default: 'sse'
     })
+    .option('httpMode', {
+      type: 'string',
+      choices: ['stateful', 'stateless'] as const,
+      default: 'stateful',
+      describe:
+        'Choose HTTP session mode when --transport=http. "stateful" uses MCP session IDs; "stateless" treats each request separately.'
+    })
     .option('storage', {
       type: 'string',
       choices: ['fs', 'upstash-redis-rest'],
@@ -514,6 +521,8 @@ async function main() {
 
   const toolsPrefix: string = (argv.toolsPrefix as string) || ''
   const storageHeaderKeyLower = (argv.storageHeaderKey as string).toLowerCase()
+  const httpMode = (argv.httpMode as 'stateful' | 'stateless') || 'stateful'
+  const isStatefulHttp = httpMode === 'stateful'
 
   // If user picks stdio => single user mode
   if (argv.transport === 'stdio') {
@@ -617,19 +626,29 @@ async function main() {
     const port = argv.port
     const app = express()
 
-    // IMPORTANT: Do not JSON-parse the MCP endpoint — the transport needs raw body/stream.
     app.use((req, res, next) => {
-      if (req.path === '/') return next()
-      return express.json()(req, res, next)
+      res.header('Access-Control-Allow-Origin', '*')
+      res.header(
+        'Access-Control-Allow-Headers',
+        ['Content-Type', 'Accept', 'Mcp-Session-Id', argv.storageHeaderKey].join(', ')
+      )
+      res.header('Access-Control-Expose-Headers', 'Mcp-Session-Id')
+      if (req.method === 'OPTIONS') {
+        res.status(204).end()
+        return
+      }
+      next()
     })
 
-    interface HttpSession {
-      userId: string
-      server: McpServer
-      transport: StreamableHTTPServerTransport
+    if (isStatefulHttp) {
+      // IMPORTANT: Do not JSON-parse the MCP endpoint — the transport needs raw body/stream.
+      app.use((req, res, next) => {
+        if (req.path === '/') return next()
+        return express.json()(req, res, next)
+      })
+    } else {
+      app.use(express.json())
     }
-    const sessions = new Map<string, HttpSession>()
-    const eventStore = new InMemoryEventStore()
 
     function createServerForUser(userId: string) {
       return createMemoryServerForUser(
@@ -642,129 +661,187 @@ async function main() {
       )
     }
 
-    // POST / => initialization (no session yet) or reuse (with mcp-session-id)
-    app.post('/', async (req: Request, res: Response) => {
-      try {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined
-        if (sessionId && sessions.has(sessionId)) {
-          const { transport } = sessions.get(sessionId)!
+    if (isStatefulHttp) {
+      interface HttpSession {
+        userId: string
+        server: McpServer
+        transport: StreamableHTTPServerTransport
+      }
+      const sessions = new Map<string, HttpSession>()
+      const eventStore = new InMemoryEventStore()
+
+      // POST / => initialization (no session yet) or reuse (with mcp-session-id)
+      app.post('/', async (req: Request, res: Response) => {
+        try {
+          const sessionId = req.headers['mcp-session-id'] as string | undefined
+          if (sessionId && sessions.has(sessionId)) {
+            const { transport } = sessions.get(sessionId)!
+            await transport.handleRequest(req, res)
+            return
+          }
+
+          // Require user header on initialization; do not allow anonymous
+          const raw = req.headers[storageHeaderKeyLower]
+          const userId =
+            typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
+          if (!userId) {
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: `Bad Request: Missing "${argv.storageHeaderKey}" header` },
+              id: (req as any)?.body?.id
+            })
+            return
+          }
+
+          const server = createServerForUser(userId)
+
+          let transport!: StreamableHTTPServerTransport
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            eventStore,
+            onsessioninitialized: (newSessionId: string) => {
+              sessions.set(newSessionId, { userId, server, transport })
+              log(`[${newSessionId}] HTTP session initialized for ${argv.storageHeaderKey}="${userId}"`)
+            }
+          })
+
+          transport.onclose = async () => {
+            const sid = transport.sessionId
+            if (sid && sessions.has(sid)) {
+              sessions.delete(sid)
+              log(`[${sid}] Transport closed; removed from session map`)
+            }
+            try {
+              await server.close()
+            } catch {
+              // best-effort cleanup; ignore if already closed
+            }
+          }
+
+          await server.connect(transport)
           await transport.handleRequest(req, res)
-          return
-        }
-
-        // Require user header on initialization; do not allow anonymous
-        const raw = req.headers[storageHeaderKeyLower]
-        const userId =
-          typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
-        if (!userId) {
-          res.status(400).json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: `Bad Request: Missing "${argv.storageHeaderKey}" header` },
-            id: (req as any)?.body?.id
-          })
-          return
-        }
-
-        const server = createServerForUser(userId)
-
-        let transport!: StreamableHTTPServerTransport
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          eventStore,
-          onsessioninitialized: (newSessionId: string) => {
-            sessions.set(newSessionId, { userId, server, transport })
-            log(`[${newSessionId}] HTTP session initialized for ${argv.storageHeaderKey}="${userId}"`)
-          }
-        })
-
-        transport.onclose = async () => {
-          const sid = transport.sessionId
-          if (sid && sessions.has(sid)) {
-            sessions.delete(sid)
-            log(`[${sid}] Transport closed; removed from session map`)
-          }
-          try {
-            await server.close()
-          } catch {
-            // best-effort cleanup; ignore if already closed
+        } catch (err) {
+          logErr('Error handling MCP POST /:', err)
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: (req as any)?.body?.id
+            })
           }
         }
-
-        await server.connect(transport)
-        await transport.handleRequest(req, res)
-      } catch (err) {
-        logErr('Error handling MCP POST /:', err)
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal server error' },
-            id: (req as any)?.body?.id
-          })
-        }
-      }
-    })
-
-    // GET / => SSE stream for server->client events (Streamable HTTP)
-    app.get('/', async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined
-      if (!sessionId || !sessions.has(sessionId)) {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-          id: (req as any)?.body?.id
-        })
-        return
-      }
-      try {
-        const { transport } = sessions.get(sessionId)!
-        await transport.handleRequest(req, res)
-      } catch (err) {
-        logErr(`[${sessionId}] Error handling MCP GET /:`, err)
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal server error' },
-            id: (req as any)?.body?.id
-          })
-        }
-      }
-    })
-
-    // DELETE / => session termination
-    app.delete('/', async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined
-      if (!sessionId || !sessions.has(sessionId)) {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-          id: (req as any)?.body?.id
-        })
-        return
-      }
-
-      // Handle OpenAI MCP bug
-      res.status(200).json({
-        jsonrpc: '2.0',
-        result: {},
       })
 
-      // try {
-      //   const { transport } = sessions.get(sessionId)!
-      //   await transport.handleRequest(req, res)
-      // } catch (err) {
-      //   logErr(`[${sessionId}] Error handling MCP DELETE /:`, err)
-      //   if (!res.headersSent) {
-      //     res.status(500).json({
-      //       jsonrpc: '2.0',
-      //       error: { code: -32603, message: 'Error handling session termination' },
-      //       id: (req as any)?.body?.id
-      //     })
-      //   }
-      // }
-    })
+      // GET / => SSE stream for server->client events (Streamable HTTP)
+      app.get('/', async (req: Request, res: Response) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined
+        if (!sessionId || !sessions.has(sessionId)) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+            id: (req as any)?.body?.id
+          })
+          return
+        }
+        try {
+          const { transport } = sessions.get(sessionId)!
+          await transport.handleRequest(req, res)
+        } catch (err) {
+          logErr(`[${sessionId}] Error handling MCP GET /:`, err)
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: (req as any)?.body?.id
+            })
+          }
+        }
+      })
+
+      // DELETE / => session termination
+      app.delete('/', async (req: Request, res: Response) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined
+        if (!sessionId || !sessions.has(sessionId)) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+            id: (req as any)?.body?.id
+          })
+          return
+        }
+
+        try {
+          const { transport } = sessions.get(sessionId)!
+          await transport.handleRequest(req, res)
+        } catch (err) {
+          logErr(`[${sessionId}] Error handling MCP DELETE /:`, err)
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Error handling session termination' },
+              id: (req as any)?.body?.id
+            })
+          }
+        }
+      })
+    } else {
+      app.post('/', async (req: Request, res: Response) => {
+        try {
+          const raw = req.headers[storageHeaderKeyLower]
+          const userId =
+            typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
+          if (!userId) {
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: { code: -32000, message: `Bad Request: Missing "${argv.storageHeaderKey}" header` },
+              id: (req as any)?.body?.id
+            })
+            return
+          }
+
+          const server = createServerForUser(userId)
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined
+          })
+
+          res.on('close', () => {
+            void transport.close()
+            void server.close()
+          })
+
+          await server.connect(transport)
+          await transport.handleRequest(req, res, req.body)
+        } catch (err) {
+          logErr('Error handling MCP POST / (stateless):', err)
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: (req as any)?.body?.id
+            })
+          }
+        }
+      })
+
+      const methodNotAllowed = (req: Request, res: Response) => {
+        res.status(405).json({
+          jsonrpc: '2.0',
+          error: {
+            code: -32000,
+            message: 'Method not allowed.'
+          },
+          id: (req as any)?.body?.id ?? null
+        })
+      }
+
+      app.get('/', methodNotAllowed)
+      app.delete('/', methodNotAllowed)
+    }
 
     app.listen(port, () => {
-      log(`Listening for Streamable HTTP on port ${port} [storage=${argv.storage}] using header "${argv.storageHeaderKey}"`)
+      log(
+        `Listening for Streamable HTTP on port ${port} [storage=${argv.storage}, httpMode=${httpMode}] using header "${argv.storageHeaderKey}"`
+      )
     })
   }
 }
