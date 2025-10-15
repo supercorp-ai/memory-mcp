@@ -3,6 +3,8 @@
 import yargs from 'yargs'
 import { hideBin } from 'yargs/helpers'
 import express, { Request, Response } from 'express'
+import cors from 'cors'
+import type { CorsOptionsDelegate } from 'cors'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -521,8 +523,33 @@ async function main() {
 
   const toolsPrefix: string = (argv.toolsPrefix as string) || ''
   const storageHeaderKeyLower = (argv.storageHeaderKey as string).toLowerCase()
+  const storageHeaderKey = argv.storageHeaderKey as string
   const httpMode = (argv.httpMode as 'stateful' | 'stateless') || 'stateful'
   const isStatefulHttp = httpMode === 'stateful'
+  const corsBaseHeaders = [
+    'Content-Type',
+    'Accept',
+    'Mcp-Session-Id',
+    'mcp-session-id',
+    storageHeaderKey,
+    storageHeaderKeyLower
+  ].filter((header): header is string => typeof header === 'string' && header.length > 0)
+  const corsOptionsDelegate: CorsOptionsDelegate<Request> = (req, callback) => {
+    const headers = new Set<string>(corsBaseHeaders)
+    const requestHeaders = req.header('Access-Control-Request-Headers')
+    if (requestHeaders) {
+      for (const header of requestHeaders.split(',')) {
+        const trimmed = header.trim()
+        if (trimmed) headers.add(trimmed)
+      }
+    }
+    callback(null, {
+      origin: true,
+      allowedHeaders: Array.from(headers),
+      exposedHeaders: ['Mcp-Session-Id']
+    })
+  }
+  const corsMiddleware = cors(corsOptionsDelegate)
 
   // If user picks stdio => single user mode
   if (argv.transport === 'stdio') {
@@ -543,6 +570,9 @@ async function main() {
     // SSE
     const port = argv.port
     const app = express()
+
+    app.use(corsMiddleware)
+    app.options('*', corsMiddleware)
 
     interface ServerSession {
       userId: string
@@ -625,20 +655,8 @@ async function main() {
   } else if (argv.transport === 'http') {
     const port = argv.port
     const app = express()
-
-    app.use((req, res, next) => {
-      res.header('Access-Control-Allow-Origin', '*')
-      res.header(
-        'Access-Control-Allow-Headers',
-        ['Content-Type', 'Accept', 'Mcp-Session-Id', argv.storageHeaderKey].join(', ')
-      )
-      res.header('Access-Control-Expose-Headers', 'Mcp-Session-Id')
-      if (req.method === 'OPTIONS') {
-        res.status(204).end()
-        return
-      }
-      next()
-    })
+    app.use(corsMiddleware)
+    app.options('*', corsMiddleware)
 
     if (isStatefulHttp) {
       // IMPORTANT: Do not JSON-parse the MCP endpoint — the transport needs raw body/stream.
