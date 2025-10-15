@@ -510,7 +510,7 @@ async function main() {
       type: 'string',
       default: undefined,
       describe:
-        '(Optional) Fixed header value to use for storage key resolution, instead of reading from request headers. Mainly for testing.'
+        '(Optional) User identifier to use when running with --transport=stdio. Ignored for SSE and HTTP modes.'
     })
     .help()
     .parseSync()
@@ -551,6 +551,25 @@ async function main() {
   }
   const corsMiddleware = cors(corsOptionsDelegate)
 
+  const resolveUserIdFromHeaders = (headers: Request['headers']) => {
+    const raw = headers[storageHeaderKeyLower]
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim()
+      return trimmed.length > 0 ? trimmed : undefined
+    }
+    if (Array.isArray(raw)) {
+      for (const value of raw) {
+        if (typeof value === 'string') {
+          const trimmed = value.trim()
+          if (trimmed.length > 0) {
+            return trimmed
+          }
+        }
+      }
+    }
+    return undefined
+  }
+
   // If user picks stdio => single user mode
   if (argv.transport === 'stdio') {
     const userId = argv.fallbackStorageHeaderValue || 'stdio-user'
@@ -590,9 +609,7 @@ async function main() {
 
     // GET / => Start SSE
     app.get('/', async (req: Request, res: Response) => {
-      const raw = req.headers[storageHeaderKeyLower]
-      const userId =
-        typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
+      const userId = resolveUserIdFromHeaders(req.headers)
       if (!userId) {
         res.status(400).json({ error: `Missing or invalid "${argv.storageHeaderKey}" header` })
         return
@@ -699,9 +716,7 @@ async function main() {
           }
 
           // Require user header on initialization; do not allow anonymous
-          const raw = req.headers[storageHeaderKeyLower]
-          const userId =
-            typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
+          const userId = resolveUserIdFromHeaders(req.headers)
           if (!userId) {
             res.status(400).json({
               jsonrpc: '2.0',
@@ -803,57 +818,138 @@ async function main() {
         }
       })
     } else {
-      app.post('/', async (req: Request, res: Response) => {
-        try {
-          const raw = req.headers[storageHeaderKeyLower]
-          const userId =
-            typeof raw === 'string' && raw.trim() ? raw.trim() : argv.fallbackStorageHeaderValue
-          if (!userId) {
-            res.status(400).json({
-              jsonrpc: '2.0',
-              error: { code: -32000, message: `Bad Request: Missing "${argv.storageHeaderKey}" header` },
-              id: (req as any)?.body?.id
-            })
-            return
-          }
+      interface StatelessSession {
+        server: McpServer
+        transport: StreamableHTTPServerTransport
+      }
 
+      const statelessSessions = new Map<string, StatelessSession>()
+      const statelessSessionPromises = new Map<string, Promise<StatelessSession>>()
+
+      const destroyStatelessSession = async (userId: string) => {
+        const session = statelessSessions.get(userId)
+        if (!session) return
+        statelessSessions.delete(userId)
+        statelessSessionPromises.delete(userId)
+        try {
+          await session.transport.close()
+        } catch (err) {
+          logErr(`[stateless:${userId}] Error closing transport:`, err)
+        }
+        try {
+          await session.server.close()
+        } catch (err) {
+          logErr(`[stateless:${userId}] Error closing server:`, err)
+        }
+      }
+
+      const getOrCreateStatelessSession = async (userId: string): Promise<StatelessSession> => {
+        const existing = statelessSessions.get(userId)
+        if (existing) {
+          return existing
+        }
+
+        const pending = statelessSessionPromises.get(userId)
+        if (pending) {
+          return pending
+        }
+
+        const creation = (async () => {
           const server = createServerForUser(userId)
           const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: undefined
           })
-
-          res.on('close', () => {
-            void transport.close()
-            void server.close()
+          transport.onerror = error => {
+            logErr(`[stateless:${userId}] Streamable HTTP transport error:`, error)
+          }
+          transport.onclose = async () => {
+            statelessSessions.delete(userId)
+            statelessSessionPromises.delete(userId)
+            try {
+              await server.close()
+            } catch (err) {
+              logErr(`[stateless:${userId}] Error closing server on transport close:`, err)
+            }
+          }
+          await server.connect(transport)
+          const session: StatelessSession = { server, transport }
+          statelessSessions.set(userId, session)
+          return session
+        })()
+          .catch(err => {
+            statelessSessionPromises.delete(userId)
+            throw err
+          })
+          .finally(() => {
+            statelessSessionPromises.delete(userId)
           })
 
-          await server.connect(transport)
-          await transport.handleRequest(req, res, req.body)
+        statelessSessionPromises.set(userId, creation)
+        return creation
+      }
+
+      const handleStatelessRequest = async (
+        req: Request,
+        res: Response,
+        handler: (session: StatelessSession, userId: string) => Promise<void>
+      ) => {
+        const userId = resolveUserIdFromHeaders(req.headers)
+        if (!userId) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: {
+              code: -32000,
+              message: `Bad Request: Missing "${argv.storageHeaderKey}" header`
+            },
+            id: (req as any)?.body?.id ?? null
+          })
+          return
+        }
+
+        try {
+          const session = await getOrCreateStatelessSession(userId)
+          await handler(session, userId)
         } catch (err) {
-          logErr('Error handling MCP POST / (stateless):', err)
+          logErr('Error handling MCP request (stateless):', err)
           if (!res.headersSent) {
             res.status(500).json({
               jsonrpc: '2.0',
               error: { code: -32603, message: 'Internal server error' },
-              id: (req as any)?.body?.id
+              id: (req as any)?.body?.id ?? null
             })
           }
         }
-      })
-
-      const methodNotAllowed = (req: Request, res: Response) => {
-        res.status(405).json({
-          jsonrpc: '2.0',
-          error: {
-            code: -32000,
-            message: 'Method not allowed.'
-          },
-          id: (req as any)?.body?.id ?? null
-        })
       }
 
-      app.get('/', methodNotAllowed)
-      app.delete('/', methodNotAllowed)
+      app.post('/', async (req: Request, res: Response) => {
+        await handleStatelessRequest(req, res, async ({ transport }, userId) => {
+          res.on('close', () => {
+            if (!res.writableEnded) {
+              logErr(`[stateless:${userId}] POST connection closed prematurely; destroying session`)
+              void destroyStatelessSession(userId)
+            }
+          })
+
+          await transport.handleRequest(req, res, req.body)
+        })
+      })
+
+      app.get('/', async (req: Request, res: Response) => {
+        await handleStatelessRequest(req, res, async ({ transport }) => {
+          await transport.handleRequest(req, res)
+        })
+      })
+
+      app.delete('/', async (req: Request, res: Response) => {
+        await handleStatelessRequest(req, res, async ({ transport }, userId) => {
+          try {
+            await transport.handleRequest(req, res)
+          } finally {
+            // ensure session is cleaned up once DELETE completes
+            void destroyStatelessSession(userId)
+          }
+        })
+      })
     }
 
     app.listen(port, () => {
