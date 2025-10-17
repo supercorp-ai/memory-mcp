@@ -535,6 +535,15 @@ async function main() {
     const port = argv.port
     const app = express()
 
+    app.use((req, res, next) => {
+      res.set({
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS,HEAD'
+      })
+      next()
+    })
+
     interface ServerSession {
       userId: string
       server: McpServer
@@ -547,6 +556,28 @@ async function main() {
     app.use((req, res, next) => {
       if (req.path === '/message') return next()
       express.json()(req, res, next)
+    })
+
+    app.options('/', (_req: Request, res: Response) => {
+      res
+        .status(204)
+        .set({
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-transform',
+          'Allow': 'GET,HEAD,OPTIONS'
+        })
+        .end()
+    })
+
+    app.head('/', (_req: Request, res: Response) => {
+      res
+        .status(204)
+        .set({
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache, no-transform',
+          'Allow': 'GET,HEAD,OPTIONS'
+        })
+        .end()
     })
 
     // GET / => Start SSE
@@ -617,6 +648,15 @@ async function main() {
     const port = argv.port
     const app = express()
 
+    app.use((req, res, next) => {
+      res.set({
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS,HEAD'
+      })
+      next()
+    })
+
     // IMPORTANT: Do not JSON-parse the MCP endpoint — the transport needs raw body/stream.
     app.use((req, res, next) => {
       if (req.path === '/') return next()
@@ -641,6 +681,28 @@ async function main() {
         toolsPrefix
       )
     }
+
+    app.options('/', (_req: Request, res: Response) => {
+      res
+        .status(204)
+        .set({
+          'Content-Type': 'application/x-mcp+json',
+          'Cache-Control': 'no-cache, no-transform',
+          'Allow': 'POST,GET,DELETE,OPTIONS,HEAD'
+        })
+        .end()
+    })
+
+    app.head('/', (_req: Request, res: Response) => {
+      res
+        .status(204)
+        .set({
+          'Content-Type': 'application/x-mcp+json',
+          'Cache-Control': 'no-cache, no-transform',
+          'Allow': 'POST,GET,DELETE,OPTIONS,HEAD'
+        })
+        .end()
+    })
 
     // POST / => initialization (no session yet) or reuse (with mcp-session-id)
     app.post('/', async (req: Request, res: Response) => {
